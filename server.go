@@ -1,16 +1,183 @@
 package hbt
 
-type HbtServer struct {
+import (
+	"bufio"
+	"context"
+	"errors"
+	"log"
+	"net"
+	"sync"
+	"time"
+)
+
+type tcpKeepAliveListener struct {
+	*net.TCPListener
 }
 
-func (s *HbtServer) Serve() {
-
+func (ln tcpKeepAliveListener) Accept() (net.Conn, error) {
+	tc, err := ln.AcceptTCP()
+	if err != nil {
+		return nil, err
+	}
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(3 * time.Minute)
+	return tc, nil
 }
 
-func (s *HbtServer) Stop() {
-
+func handleMessage(msg string, c net.Conn) {
+	if msg == "ping" {
+		c.Write([]byte("pong\n"))
+	} else {
+		c.Write([]byte("unknown\n"))
+	}
 }
 
-func NewHbtServer() *HbtServer {
+type TCPServer struct {
+	Addr       string
+	mu         sync.Mutex
+	listener   net.Listener
+	conns      map[*net.Conn]struct{}
+	doneChan   chan struct{}
+	onShutdown []func()
+}
 
+func (s *TCPServer) getDoneChan() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getDoneChanLocked()
+}
+
+func (s *TCPServer) getDoneChanLocked() chan struct{} {
+	if s.doneChan == nil {
+		s.doneChan = make(chan struct{})
+	}
+	return s.doneChan
+}
+
+func (s *TCPServer) closeDoneChanLocked() {
+	ch := s.getDoneChanLocked()
+	select {
+	case <-ch:
+		// Already closed. Don't close again.
+	default:
+		// Safe to close here. We're the only closer, guarded
+		// by s.mu.
+		close(ch)
+	}
+}
+
+func (s *TCPServer) ListenAndServe() error {
+	l, err := net.Listen("tcp", s.Addr)
+	if err != nil {
+		return err
+	}
+	s.listener = tcpKeepAliveListener{l.(*net.TCPListener)}
+	defer l.Close()
+
+	return s.serve()
+}
+
+var ErrServerClosed = errors.New("TCPServer closed")
+
+func (s *TCPServer) serve() error {
+	ctx, _ := context.WithCancel(context.Background())
+	var tempDelay time.Duration // how long to sleep on accept failure
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			select {
+			case <-s.getDoneChan():
+				return ErrServerClosed
+			default:
+			}
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if max := 1 * time.Second; tempDelay > max {
+					tempDelay = max
+				}
+				log.Printf("TCPServer Accept error: %v; retrying in %v", err, tempDelay)
+				time.Sleep(tempDelay)
+				continue
+			}
+			return err
+		}
+		go s.serveConn(ctx, conn)
+	}
+}
+
+func (s *TCPServer) serveConn(ctx context.Context, c net.Conn) {
+	peer := c.RemoteAddr().String()
+	log.Println("new connection from", peer)
+	s.addConn(&c)
+	defer s.removeConn(&c)
+	defer c.Close()
+	scanner := bufio.NewScanner(c)
+	for scanner.Scan() {
+		msg := scanner.Text()
+		if len(msg) == 0 {
+			break
+		}
+		handleMessage(msg, c)
+	}
+	log.Println("connection:", peer, "lost")
+}
+
+var shutdownPollInterval = 500 * time.Millisecond
+
+func (s *TCPServer) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	s.closeDoneChanLocked()
+	for _, f := range s.onShutdown {
+		go f()
+	}
+	s.mu.Unlock()
+
+	ticker := time.NewTicker(shutdownPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+	return s.listener.Close()
+}
+
+func (s *TCPServer) RegisterOnShutdown(f func()) {
+	s.mu.Lock()
+	s.onShutdown = append(s.onShutdown, f)
+	s.mu.Unlock()
+}
+
+func (s *TCPServer) addConn(conn *net.Conn) {
+	s.mu.Lock()
+	s.conns[conn] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *TCPServer) removeConn(conn *net.Conn) {
+	s.mu.Lock()
+	delete(s.conns, conn)
+	s.mu.Unlock()
+}
+
+func (s *TCPServer) ConnNum() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.conns)
+}
+
+func NewTCPServer(addr string) *TCPServer {
+	var ts *TCPServer
+	if addr == "" {
+		addr = "localhost:8080"
+	}
+	ts.Addr = addr
+	ts.conns = make(map[*net.Conn]struct{})
+	return ts
 }

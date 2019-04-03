@@ -14,6 +14,7 @@ func main() {
 	flag.StringVar(&port, "port", "8888", "端口")
 	flag.Parse()
 	fmt.Println(host, port)
+
 	l, err := net.Listen("tcp", fmt.Sprintf("%s:%s", host, port))
 	if err != nil {
 		log.Fatal(err)
