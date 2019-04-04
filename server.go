@@ -24,6 +24,21 @@ func (ln tcpKeepAliveListener) Accept() (net.Conn, error) {
 	return tc, nil
 }
 
+// onceCloseListener wraps a net.Listener, protecting it from
+// multiple Close calls.
+type onceCloseListener struct {
+	net.Listener
+	once     sync.Once
+	closeErr error
+}
+
+func (oc *onceCloseListener) Close() error {
+	oc.once.Do(oc.close)
+	return oc.closeErr
+}
+
+func (oc *onceCloseListener) close() { oc.closeErr = oc.Listener.Close() }
+
 func handleMessage(msg string, c net.Conn) {
 	if msg == "ping" {
 		c.Write([]byte("pong\n"))
@@ -35,10 +50,14 @@ func handleMessage(msg string, c net.Conn) {
 type TCPServer struct {
 	Addr       string
 	mu         sync.Mutex
-	listener   net.Listener
-	conns      map[*net.Conn]struct{}
+	listener   *net.Listener
+	activeConn map[*net.Conn]struct{}
 	doneChan   chan struct{}
 	onShutdown []func()
+
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	IdleTimeout  time.Duration
 }
 
 func (s *TCPServer) getDoneChan() <-chan struct{} {
@@ -71,19 +90,21 @@ func (s *TCPServer) ListenAndServe() error {
 	if err != nil {
 		return err
 	}
-	s.listener = tcpKeepAliveListener{l.(*net.TCPListener)}
+	l = tcpKeepAliveListener{l.(*net.TCPListener)}
+	l = &onceCloseListener{Listener: l}
 	defer l.Close()
+	s.listener = &l
 
 	return s.serve()
 }
 
-var ErrServerClosed = errors.New("TCPServer closed")
+var ErrServerClosed = errors.New("server closed")
 
 func (s *TCPServer) serve() error {
-	ctx, _ := context.WithCancel(context.Background())
+	ctx := context.Background()
 	var tempDelay time.Duration // how long to sleep on accept failure
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := (*s.listener).Accept()
 		if err != nil {
 			select {
 			case <-s.getDoneChan():
@@ -99,12 +120,13 @@ func (s *TCPServer) serve() error {
 				if max := 1 * time.Second; tempDelay > max {
 					tempDelay = max
 				}
-				log.Printf("TCPServer Accept error: %v; retrying in %v", err, tempDelay)
+				log.Printf("accept error: %v; retrying in %v", err, tempDelay)
 				time.Sleep(tempDelay)
 				continue
 			}
 			return err
 		}
+		tempDelay = 0
 		go s.serveConn(ctx, conn)
 	}
 }
@@ -126,10 +148,28 @@ func (s *TCPServer) serveConn(ctx context.Context, c net.Conn) {
 	log.Println("connection:", peer, "lost")
 }
 
+// Close immediately closes net.Listener and all connections
+func (s *TCPServer) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeDoneChanLocked()
+	err := (*s.listener).Close()
+	for c := range s.activeConn {
+		e := (*c).Close()
+		if e != nil && err == nil {
+			err = e
+		}
+		delete(s.activeConn, c)
+	}
+	return err
+}
+
 var shutdownPollInterval = 500 * time.Millisecond
 
+// gracefully shutdown
 func (s *TCPServer) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
+	_ = (*s.listener).Close()
 	s.closeDoneChanLocked()
 	for _, f := range s.onShutdown {
 		go f()
@@ -145,7 +185,6 @@ func (s *TCPServer) Shutdown(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
-	return s.listener.Close()
 }
 
 func (s *TCPServer) RegisterOnShutdown(f func()) {
@@ -156,20 +195,20 @@ func (s *TCPServer) RegisterOnShutdown(f func()) {
 
 func (s *TCPServer) addConn(conn *net.Conn) {
 	s.mu.Lock()
-	s.conns[conn] = struct{}{}
+	s.activeConn[conn] = struct{}{}
 	s.mu.Unlock()
 }
 
 func (s *TCPServer) removeConn(conn *net.Conn) {
 	s.mu.Lock()
-	delete(s.conns, conn)
+	delete(s.activeConn, conn)
 	s.mu.Unlock()
 }
 
 func (s *TCPServer) ConnNum() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.conns)
+	return len(s.activeConn)
 }
 
 func NewTCPServer(addr string) *TCPServer {
@@ -178,6 +217,6 @@ func NewTCPServer(addr string) *TCPServer {
 		addr = "localhost:8080"
 	}
 	ts.Addr = addr
-	ts.conns = make(map[*net.Conn]struct{})
+	ts.activeConn = make(map[*net.Conn]struct{})
 	return ts
 }
