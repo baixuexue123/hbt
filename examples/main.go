@@ -1,30 +1,37 @@
-package hbt
+package main
 
 import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
+	"os"
+	"os/signal"
+
+	"github.com/baixuexue123/hbt"
 )
 
-func main() {
-	var host string
-	var port string
-	flag.StringVar(&host, "host", "127.0.0.1", "主机")
-	flag.StringVar(&port, "port", "8888", "端口")
-	flag.Parse()
-	fmt.Println(host, port)
+var host string
+var port string
 
-	l, err := net.Listen("tcp", fmt.Sprintf("%s:%s", host, port))
+func init() {
+	flag.StringVar(&host, "host", "127.0.0.1", "host")
+	flag.StringVar(&port, "port", "8888", "port")
+}
+
+func main() {
+	flag.Parse()
+
+	TServer := hbt.NewTCPServer(fmt.Sprintf("%s:%s", host, port))
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
+	go func() {
+		<-sigChan
+		TServer.Shutdown()
+	}()
+
+	err := TServer.ListenAndServe()
 	if err != nil {
 		log.Fatal(err)
-	}
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			log.Println(err)
-			continue
-		}
-		go HbtHandler(conn)
 	}
 }

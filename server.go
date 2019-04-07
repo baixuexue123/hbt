@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -39,11 +40,11 @@ func (oc *onceCloseListener) Close() error {
 
 func (oc *onceCloseListener) close() { oc.closeErr = oc.Listener.Close() }
 
-func handleMessage(msg string, c net.Conn) {
+func handleMessage(msg string, w io.Writer) {
 	if msg == "ping" {
-		c.Write([]byte("pong\n"))
+		w.Write([]byte("pong\n"))
 	} else {
-		c.Write([]byte("unknown\n"))
+		w.Write([]byte("unknown\n"))
 	}
 }
 
@@ -54,10 +55,6 @@ type TCPServer struct {
 	activeConn map[*net.Conn]struct{}
 	doneChan   chan struct{}
 	onShutdown []func()
-
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-	IdleTimeout  time.Duration
 }
 
 func (s *TCPServer) getDoneChan() <-chan struct{} {
@@ -95,6 +92,7 @@ func (s *TCPServer) ListenAndServe() error {
 	defer l.Close()
 	s.listener = &l
 
+	log.Println("listen", s.Addr)
 	return s.serve()
 }
 
@@ -140,16 +138,12 @@ func (s *TCPServer) serveConn(ctx context.Context, c net.Conn) {
 	scanner := bufio.NewScanner(c)
 	for scanner.Scan() {
 		msg := scanner.Text()
-		if len(msg) == 0 {
-			break
-		}
 		handleMessage(msg, c)
 	}
 	log.Println("connection:", peer, "lost")
 }
 
-// Close immediately closes net.Listener and all connections
-func (s *TCPServer) Close() error {
+func (s *TCPServer) Shutdown() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closeDoneChanLocked()
@@ -159,32 +153,11 @@ func (s *TCPServer) Close() error {
 		if e != nil && err == nil {
 			err = e
 		}
-		delete(s.activeConn, c)
 	}
-	return err
-}
-
-var shutdownPollInterval = 500 * time.Millisecond
-
-// gracefully shutdown
-func (s *TCPServer) Shutdown(ctx context.Context) error {
-	s.mu.Lock()
-	_ = (*s.listener).Close()
-	s.closeDoneChanLocked()
 	for _, f := range s.onShutdown {
 		go f()
 	}
-	s.mu.Unlock()
-
-	ticker := time.NewTicker(shutdownPollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
+	return err
 }
 
 func (s *TCPServer) RegisterOnShutdown(f func()) {
@@ -212,11 +185,11 @@ func (s *TCPServer) ConnNum() int {
 }
 
 func NewTCPServer(addr string) *TCPServer {
-	var ts *TCPServer
+	var ts TCPServer
 	if addr == "" {
 		addr = "localhost:8080"
 	}
 	ts.Addr = addr
 	ts.activeConn = make(map[*net.Conn]struct{})
-	return ts
+	return &ts
 }
